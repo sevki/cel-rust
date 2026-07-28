@@ -21,12 +21,14 @@ mod macros;
 
 pub mod common;
 pub mod context;
+pub mod cost;
 mod env;
 pub mod parser;
 
 pub use common::ast::IdedExpr;
 use common::ast::SelectExpr;
 pub use context::Context;
+pub use cost::{ActualCostEstimator, CostTracker, CostTrackerBuilder, FunctionTracker};
 pub use functions::FunctionContext;
 pub use objects::{ResolveResult, Value};
 use parser::{Expression, ExpressionReferences, Parser};
@@ -131,6 +133,9 @@ pub enum ExecutionError {
     IndexOutOfBounds(Value),
     #[error("InternalError: {0:?}")]
     InternalError(String),
+    /// Indicates that execution exceeded the configured runtime cost limit.
+    #[error("operation cancelled: actual cost limit exceeded")]
+    CostLimitExceeded,
 }
 
 impl ExecutionError {
@@ -188,6 +193,11 @@ impl Program {
 
     pub fn execute(&self, context: &Context) -> ResolveResult {
         Value::resolve(&self.expression, context)
+    }
+
+    /// Executes the program while recording its runtime cost.
+    pub fn execute_with_cost(&self, context: &Context, tracker: &mut CostTracker) -> ResolveResult {
+        cost::with_tracker(tracker, || Value::resolve(&self.expression, context))
     }
 
     /// Returns the variables and functions referenced by the CEL program
