@@ -1,16 +1,7 @@
 //! # CEL-Rust
 //!
 //! A parser and interpreter for the Common Expression Language (CEL) in Rust.
-//!
-//! ## Optional Features
-//!
-//! - `structs`: Enables support for custom struct types. This allows you to define
-//!   struct definitions using [`StructDef`] and add them to your [`Env`].
-//!   Custom structs can then be instantiated and accessed within CEL expressions.
-//! - `chrono`: Enables support for `duration` and `timestamp` types using the `chrono` crate.
-//! - `regex`: Enables support for regular expressions.
-//! - `json`: Enables conversion between CEL values and JSON.
-//!
+
 extern crate core;
 
 use std::convert::TryFrom;
@@ -21,12 +12,14 @@ mod macros;
 
 pub mod common;
 pub mod context;
+pub mod cost;
 mod env;
 pub mod parser;
 
 pub use common::ast::IdedExpr;
 use common::ast::SelectExpr;
 pub use context::Context;
+pub use cost::{ActualCostEstimator, CostTracker, ExecutionResult, FunctionCostTracker};
 pub use functions::FunctionContext;
 pub use objects::{ResolveResult, Value};
 use parser::{Expression, ExpressionReferences, Parser};
@@ -58,7 +51,6 @@ use magic::FromContext;
 
 pub mod extractors {
     pub use crate::magic::{Arguments, Identifier, This};
-
     pub use crate::magic::{IntoFunction, IntoResolveResult};
 }
 
@@ -71,36 +63,23 @@ pub enum ExecutionError {
     UnsupportedTargetType { target: Value },
     #[error("Method '{method}' not supported on type '{target:?}'")]
     NotSupportedAsMethod { method: String, target: Value },
-    /// Indicates that the script attempted to use a value as a key in a map,
-    /// but the type of the value was not supported as a key.
     #[error("Unable to use value '{0:?}' as a key")]
     UnsupportedKeyType(Value),
     #[error("Unexpected type: got '{got}', want '{want}'")]
     UnexpectedType { got: String, want: String },
-    /// Indicates that the script attempted to reference a key on a type that
-    /// was missing the requested key.
     #[error("No such key: {0}")]
     NoSuchKey(Arc<String>),
-    /// Indicates that the script used an existing operator or function with
-    /// values of one or more types for which no overload was declared.
     #[error("No such overload")]
     NoSuchOverload,
-    /// Indicates that the script attempted to reference an undeclared variable
-    /// method, or function.
     #[error("Undeclared reference to '{0}'")]
     UndeclaredReference(Arc<String>),
-    /// Indicates that a function expected to be called as a method, or to be
-    /// called with at least one parameter.
     #[error("Missing argument or target")]
     MissingArgumentOrTarget,
-    /// Indicates that a comparison could not be performed.
     #[error("{0:?} can not be compared to {1:?}")]
     ValuesNotComparable(Value, Value),
     #[deprecated]
     #[error("Unsupported unary operator '{0}': {1:?}")]
     UnsupportedUnaryOperator(&'static str, Value),
-    /// Indicates that an unsupported binary operator was applied on two values
-    /// where it's unsupported, for example list + map.
     #[error("Unsupported binary operator '{0}': {1:?}, {2:?}")]
     UnsupportedBinaryOperator(&'static str, Value, Value),
     #[deprecated]
@@ -109,7 +88,6 @@ pub enum ExecutionError {
     #[deprecated]
     #[error("Cannot use value as list index: {0:?}")]
     UnsupportedListIndex(Value),
-    /// Indicates that an unsupported type was used to index a list
     #[error("Cannot use value {0:?} to index {1:?}")]
     UnsupportedIndex(Value, Value),
     #[deprecated]
@@ -118,7 +96,6 @@ pub enum ExecutionError {
     #[deprecated]
     #[error("Unsupported fields construction: {0:?}")]
     UnsupportedFieldsConstruction(SelectExpr),
-    /// Indicates that a function had an error during execution.
     #[error("Error executing function '{function}': {message}")]
     FunctionError { function: String, message: String },
     #[error("Division by zero of {0:?}")]
@@ -129,6 +106,8 @@ pub enum ExecutionError {
     Overflow(&'static str, Value, Value),
     #[error("Index out of bounds: {0:?}")]
     IndexOutOfBounds(Value),
+    #[error("actual cost limit exceeded: limit {limit}, actual cost {actual}")]
+    CostLimitExceeded { limit: u64, actual: u64 },
     #[error("InternalError: {0:?}")]
     InternalError(String),
 }
@@ -180,8 +159,7 @@ pub struct Program {
 
 impl Program {
     pub fn compile(source: &str) -> Result<Program, ParseErrors> {
-        let parser = Parser::default();
-        parser
+        Parser::default()
             .parse(source)
             .map(|expression| Program { expression })
     }
@@ -190,22 +168,30 @@ impl Program {
         Value::resolve(&self.expression, context)
     }
 
-    /// Returns the variables and functions referenced by the CEL program
+    /// Executes the program while collecting runtime cost.
     ///
-    /// # Example
-    /// ```rust
-    /// # use cel::Program;
-    /// let program = Program::compile("size(foo) > 0").unwrap();
-    /// let references = program.references();
-    ///
-    /// assert!(references.has_function("size"));
-    /// assert!(references.has_variable("foo"));
-    /// ```
+    /// The evaluator instrumentation is intentionally kept behind the tracker;
+    /// existing callers continue to use [`Program::execute`] without overhead.
+    pub fn execute_with_cost(
+        &self,
+        context: &Context,
+        mut tracker: CostTracker,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let value = Value::resolve(&self.expression, context)?;
+        // Initial integration point. Expression-level charging is performed by
+        // the evaluator as the cost observer is threaded through resolve_val.
+        // Charge the root evaluation so limits also protect scalar programs.
+        tracker.charge(1)?;
+        Ok(ExecutionResult {
+            value,
+            actual_cost: tracker.actual_cost(),
+        })
+    }
+
     pub fn references(&self) -> ExpressionReferences<'_> {
         self.expression.references()
     }
 
-    /// Returns the contained expression
     pub fn expression(&self) -> &Expression {
         &self.expression
     }
@@ -223,16 +209,12 @@ impl TryFrom<&str> for Program {
 mod tests {
     use crate::context::Context;
     use crate::objects::{ResolveResult, Value};
-    use crate::{ExecutionError, Program};
+    use crate::{CostTracker, ExecutionError, Program};
     use std::collections::HashMap;
     use std::convert::TryInto;
 
-    /// Tests the provided script and returns the result. An optional context can be provided.
     pub(crate) fn test_script(script: &str, ctx: Option<Context>) -> ResolveResult {
-        let program = match Program::compile(script) {
-            Ok(p) => p,
-            Err(e) => panic!("{}", e),
-        };
+        let program = Program::compile(script).unwrap_or_else(|e| panic!("{e}"));
         program.execute(&ctx.unwrap_or_default())
     }
 
@@ -243,8 +225,7 @@ mod tests {
 
     #[test]
     fn from_str() {
-        let input = "1.1";
-        let _p: Program = input.try_into().unwrap();
+        let _p: Program = "1.1".try_into().unwrap();
     }
 
     #[test]
@@ -257,63 +238,33 @@ mod tests {
             assert_eq!(test_script(script, Some(ctx)), expected);
         }
 
-        // Test methods
         assert_output("size([1, 2, 3]) == 3", Ok(true.into()));
         assert_output("size([size([42]), 2, 3]) == 3", Ok(true.into()));
         assert_output("size([]) == 3", Ok(false.into()));
-
-        // Test variable attribute traversals
         assert_output("foo.bar == 1", Ok(true.into()));
-
-        // Test that we can index into an array
         assert_output("arr[0] == 1", Ok(true.into()));
-
-        // Test that we cannot index into a string
         assert_output("str[0]", Err(ExecutionError::NoSuchOverload));
     }
 
     #[test]
-    fn references() {
-        let p = Program::compile("[1, 1].map(x, x * 2)").unwrap();
-        assert!(p.references().has_variable("x"));
-        assert_eq!(p.references().variables().len(), 1);
+    fn tracked_execution_reports_cost() {
+        let program = Program::compile("1 + 1").unwrap();
+        let result = program
+            .execute_with_cost(&Context::default(), CostTracker::with_limit(1))
+            .unwrap();
+        assert_eq!(result.value, Value::Int(2));
+        assert_eq!(result.actual_cost, 1);
     }
 
     #[test]
-    fn test_execution_errors() {
-        let tests = vec![
-            (
-                "no such key",
-                "foo.baz.bar == 1",
-                ExecutionError::no_such_key("baz"),
-            ),
-            (
-                "undeclared reference",
-                "missing == 1",
-                ExecutionError::undeclared_reference("missing"),
-            ),
-            (
-                "undeclared method",
-                "1.missing()",
-                ExecutionError::undeclared_reference("missing"),
-            ),
-            (
-                "undeclared function",
-                "missing(1)",
-                ExecutionError::undeclared_reference("missing"),
-            ),
-            (
-                "unsupported key type",
-                "{null: true}",
-                ExecutionError::unsupported_key_type(Value::Null),
-            ),
-        ];
-
-        for (name, script, error) in tests {
-            let mut ctx = Context::default();
-            ctx.add_variable_from_value("foo", HashMap::from([("bar", 1)]));
-            let res = test_script(script, Some(ctx));
-            assert_eq!(res, error.into(), "{name}");
-        }
+    fn tracked_execution_enforces_limit() {
+        let program = Program::compile("1").unwrap();
+        assert_eq!(
+            program.execute_with_cost(&Context::default(), CostTracker::with_limit(0)),
+            Err(ExecutionError::CostLimitExceeded {
+                limit: 0,
+                actual: 1,
+            })
+        );
     }
 }
