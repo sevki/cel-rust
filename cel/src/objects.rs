@@ -1007,6 +1007,16 @@ impl Value {
         expr: &'a Expression,
         ctx: &'a Context<'a>,
     ) -> Result<Cow<'a, dyn Val>, ExecutionError> {
+        let value = Self::resolve_val_inner(expr, ctx)?;
+        crate::cost::observe(expr, value.as_ref())?;
+        Ok(value)
+    }
+
+    #[inline(always)]
+    fn resolve_val_inner<'a>(
+        expr: &'a Expression,
+        ctx: &'a Context<'a>,
+    ) -> Result<Cow<'a, dyn Val>, ExecutionError> {
         match &expr.expr {
             Expr::Literal(literal) => Ok(literal.to_val()),
             Expr::Call(call) => {
