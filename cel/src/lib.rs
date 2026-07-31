@@ -22,6 +22,7 @@ mod macros;
 pub mod common;
 pub mod context;
 pub mod cost;
+pub mod cps;
 mod env;
 pub mod parser;
 

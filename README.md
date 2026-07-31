@@ -52,3 +52,4 @@ Check out these other examples to learn how to use this library:
 - [Variables](./example/src/variables.rs) - Passing variables and using them in your program.
 - [Functions](./example/src/functions.rs) - Defining and using custom functions in your program.
 - [Concurrent Execution](./example/src/threads.rs) - Executing the same program concurrently.
+- [Continuation-Passing Style](./example/src/cps.rs) - Chaining evaluations with the [`cel::cps`](./cel/src/cps.rs) module.

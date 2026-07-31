@@ -65,6 +65,8 @@ jobs:
         run: cargo run --bin example-functions --manifest-path example/Cargo.toml --features chrono
       - name: Run example-threads
         run: cargo run --bin example-threads --manifest-path example/Cargo.toml
+      - name: Run example-cps
+        run: cargo run --bin example-cps --manifest-path example/Cargo.toml
       - name: Run example-serde
         run: cargo run --bin example-serde --manifest-path example/Cargo.toml
       - name: Run example-json
