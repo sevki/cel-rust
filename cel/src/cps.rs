@@ -87,6 +87,11 @@ macro_rules! try_step {
     };
 }
 
+/// A continuation: given the [`ResolveResult`] of the program that was just
+/// run (and the shared context, for binding variables), produces the next
+/// [`Step`].
+type Continuation<'p> = Box<dyn FnOnce(ResolveResult, &mut Context<'p>) -> Step<'p> + 'p>;
+
 /// What to do after a [`Program`] has produced a [`ResolveResult`].
 ///
 /// Build a `Step` with [`Step::cont`] to run a program and react to its
@@ -98,7 +103,7 @@ pub enum Step<'p> {
     /// next `Step`.
     Continue {
         program: &'p Program,
-        k: Box<dyn FnOnce(ResolveResult, &mut Context<'p>) -> Step<'p> + 'p>,
+        k: Continuation<'p>,
     },
     /// Stop the chain, producing a final result.
     Done(ResolveResult),
