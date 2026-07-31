@@ -17,13 +17,19 @@
 //!
 //! [`Pipeline`] is a convenience builder for the common case of running a
 //! fixed sequence of programs, binding each result to a variable for the
-//! next one, and stopping at the first error.
+//! next one, and stopping at the first error. The [`pipeline!`] macro builds
+//! one from a literal list of `"name" => program` pairs.
+//!
+//! Writing a [`Step::cont`] continuation by hand means unwrapping its
+//! `ResolveResult` and propagating any error yourself; the [`try_step!`]
+//! macro does that in one line, the same way the `?` operator does for
+//! ordinary `Result`-returning functions.
 //!
 //! # Example
 //!
 //! ```
 //! use cel::cps::{run, Step};
-//! use cel::{Context, Program};
+//! use cel::{try_step, Context, Program};
 //!
 //! let double = Program::compile("x * 2").unwrap();
 //! let mut ctx = Context::default();
@@ -31,7 +37,7 @@
 //!
 //! // Run `double`, bind its result back to `x`, then run it again.
 //! let step = Step::cont(&double, |result, ctx| {
-//!     let value = result.unwrap();
+//!     let value = try_step!(result);
 //!     ctx.add_variable_from_value("x", value);
 //!     Step::cont(&double, |result, _ctx| Step::done(result))
 //! });
@@ -39,6 +45,47 @@
 //! assert_eq!(run(step, &mut ctx), Ok(20i64.into()));
 //! ```
 use crate::{Context, Program, ResolveResult, Value};
+
+/// Unwraps a [`ResolveResult`] inside a [`Step::cont`] continuation, or
+/// exits that continuation immediately with [`Step::done`] if it was an
+/// error — the `Step`-chain equivalent of the `?` operator, for the cases
+/// where `?` itself doesn't apply (a continuation's return type is `Step`,
+/// not a `Result`).
+///
+/// Must be used inside a closure passed to [`Step::cont`] (or one that
+/// otherwise returns [`Step`]), since it `return`s on the error path.
+///
+/// # Example
+///
+/// ```
+/// use cel::cps::{run, Step};
+/// use cel::{try_step, Context, Program};
+///
+/// let square = Program::compile("x * x").unwrap();
+/// let add_one = Program::compile("x + 1").unwrap();
+/// let mut ctx = Context::default();
+/// ctx.add_variable_from_value("x", 4i64);
+///
+/// let step = Step::cont(&square, |result, ctx| {
+///     let value = try_step!(result);
+///     ctx.add_variable_from_value("x", value);
+///     Step::cont(&add_one, |result, _ctx| {
+///         let value = try_step!(result);
+///         Step::done(Ok(value))
+///     })
+/// });
+///
+/// assert_eq!(run(step, &mut ctx), Ok(17i64.into()));
+/// ```
+#[macro_export]
+macro_rules! try_step {
+    ($result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(err) => return $crate::cps::Step::done(Err(err)),
+        }
+    };
+}
 
 /// What to do after a [`Program`] has produced a [`ResolveResult`].
 ///
@@ -158,6 +205,35 @@ impl<'p> Pipeline<'p> {
     }
 }
 
+/// Builds a [`Pipeline`] from a literal list of `"name" => program` pairs,
+/// instead of chaining [`Pipeline::then`] calls by hand.
+///
+/// # Example
+///
+/// ```
+/// use cel::cps::pipeline;
+/// use cel::{Context, Program};
+///
+/// let step1 = Program::compile("2 + 2").unwrap();
+/// let step2 = Program::compile("total * 10").unwrap();
+///
+/// let built = pipeline![
+///     "total" => &step1,
+///     "result" => &step2,
+/// ];
+///
+/// let mut ctx = Context::default();
+/// assert_eq!(built.run(&mut ctx), Ok(40i64.into()));
+/// ```
+#[macro_export]
+macro_rules! cps_pipeline {
+    ($($name:literal => $program:expr),+ $(,)?) => {
+        $crate::cps::Pipeline::new()$(.then($name, $program))+
+    };
+}
+
+pub use crate::cps_pipeline as pipeline;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +339,60 @@ mod tests {
         let pipeline = Pipeline::new();
         let mut ctx = Context::default();
         assert_eq!(pipeline.run(&mut ctx), Ok(Value::Null));
+    }
+
+    #[test]
+    fn pipeline_macro_matches_builder() {
+        let step1 = Program::compile("2 + 2").unwrap();
+        let step2 = Program::compile("total * 10").unwrap();
+
+        let built = pipeline![
+            "total" => &step1,
+            "result" => &step2,
+        ];
+
+        let mut ctx = Context::default();
+        assert_eq!(built.run(&mut ctx), Ok(40i64.into()));
+    }
+
+    #[test]
+    fn try_step_macro_unwraps_ok_and_continues() {
+        let square = Program::compile("x * x").unwrap();
+        let add_one = Program::compile("x + 1").unwrap();
+        let mut ctx = Context::default();
+        ctx.add_variable_from_value("x", 4i64);
+
+        let step = Step::cont(&square, |result, ctx| {
+            let value = try_step!(result);
+            ctx.add_variable_from_value("x", value);
+            Step::cont(&add_one, |result, _ctx| {
+                let value = try_step!(result);
+                Step::done(Ok(value))
+            })
+        });
+
+        assert_eq!(run(step, &mut ctx), Ok(17i64.into()));
+    }
+
+    #[test]
+    fn try_step_macro_short_circuits_on_error() {
+        let fails = Program::compile("missing_variable").unwrap();
+        let never_runs = Program::compile("1 / 0").unwrap();
+        let mut ctx = Context::default();
+
+        let mut second_step_ran = false;
+        let step = Step::cont(&fails, |result, _ctx| {
+            let _value = try_step!(result);
+            second_step_ran = true;
+            Step::cont(&never_runs, |result, _ctx| {
+                let value = try_step!(result);
+                Step::done(Ok(value))
+            })
+        });
+
+        let result = run(step, &mut ctx);
+        assert!(result.is_err());
+        assert!(!second_step_ran);
     }
 
     /// A chain long enough that a non-trampolined implementation (each
