@@ -17,8 +17,10 @@ fn pipeline_demo() {
     let with_tax = Program::compile("subtotal + subtotal * tax_rate").unwrap();
 
     let mut ctx = Context::default();
+    // CEL doesn't implicitly convert between int and double in arithmetic,
+    // so quantity has to be a double here too to multiply against price.
     ctx.add_variable_from_value("price", 19.99);
-    ctx.add_variable_from_value("quantity", 3i64);
+    ctx.add_variable_from_value("quantity", 3.0);
     ctx.add_variable_from_value("tax_rate", 0.0725);
 
     let pipeline = pipeline![
